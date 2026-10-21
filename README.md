@@ -132,11 +132,14 @@ reports:
 Invalid PORT "abc": expected an integer between 1024 and 65535. Unset PORT to use the default 3000, or set it to a value in that range.
 ```
 
-A value below `1024` reports:
+A whole number below `1024` (`80` and `0`, for example) reports:
 
 ```text
 Invalid PORT "80": ports below 1024 are privileged and cannot be used. Set PORT to a value between 1024 and 65535, or unset it to use the default 3000.
 ```
+
+Only a plain whole number below `1024` takes that message. A value below `1024` that is not one, a
+negative such as `-1` included, reports the range message above instead.
 
 ## Shutting down
 
@@ -168,6 +171,13 @@ npm test
 ```
 
 Runs the `node:test` suite that covers the functional, logging, configuration and shutdown gates.
+
+The runner's `--test` flag exists from Node.js v18.1.0, so on a runtime at exactly v18.0.0 run the
+same suite directly:
+
+```bash
+node test/server.test.js
+```
 
 ```bash
 npm run bench
