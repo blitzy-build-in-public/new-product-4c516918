@@ -98,6 +98,18 @@ const SHUTDOWN_LINE_PATTERN =
 const STARTUP_TIMEOUT_MS = 10000;
 const LINE_POLL_INTERVAL_MS = 10;
 
+// The two waits that follow a live server are bounded for the same reason, because the plan makes a
+// server that is still listening after SIGINT, or that never answers, a failure of the shutdown and
+// request gates: without a bound that failure would arrive as a run that never ends instead.
+const SIGINT_EXIT_TIMEOUT_MS = 5000;
+const REQUEST_TIMEOUT_MS = 5000;
+
+// The probed port is unowned between the probe releasing it and the child binding it, and this host
+// is shared with runs drawing from the same ephemeral pool, so that window can be lost to another
+// process: a spawn that failed only because of the collision is retried with a fresh port instead of
+// failing the case as a false negative.
+const PROBED_PORT_ATTEMPTS = 3;
+
 // The shutdown case waits for exactly three lines: the startup line, one request line, and the
 // shutdown line.
 const SHUTDOWN_CASE_LINE_COUNT = 3;
@@ -208,7 +220,7 @@ async function spawnListeningServer(env, expectedPort) {
     port: expectedPort,
     stdoutLines: [],
     stderrText: '',
-    stop: () => stopServer(child),
+    stop: () => stopServer(server),
   };
 
   child.stderr.setEncoding('utf8');
@@ -230,11 +242,17 @@ async function spawnListeningServer(env, expectedPort) {
 
     const rejectOnEarlyExit = (code, signal) => {
       clearTimeout(timer);
-      reject(
-        new Error(
-          `The server exited before printing "${expectedStartupLine}" (code ${code}, signal ${signal}).\n${describeOutput(server.stdoutLines, server.stderrText)}`,
-        ),
+
+      const error = new Error(
+        `The server exited before printing "${expectedStartupLine}" (code ${code}, signal ${signal}).\n${describeOutput(server.stdoutLines, server.stderrText)}`,
       );
+
+      // Carried as a flag rather than re-parsed from stderr at the call site: losing the port to
+      // another process is the one early exit a caller may retry, and the child's own message is
+      // what identifies it. 'close' fires once both pipes are drained, so the text is complete here.
+      error.portInUse = server.stderrText.includes(portInUseMessage(expectedPort));
+
+      reject(error);
     };
 
     child.once('error', (error) => {
@@ -260,25 +278,84 @@ async function spawnListeningServer(env, expectedPort) {
 /*
  * Starts the server on a port the operating system chooses, for the cases that only need a working
  * server. Output: the object spawnListeningServer returns, carrying the port it bound.
+ *
+ * The port can be taken by another process in the window between the probe releasing it and the
+ * child binding it, which on a shared host is a false negative rather than a defect, so a spawn
+ * whose failure was that collision is retried with a fresh port, up to PROBED_PORT_ATTEMPTS times.
+ * Anything else is reported at once, and the last attempt's error is thrown when every attempt
+ * collided, so the case still fails with the child's own EADDRINUSE diagnostic. The fixed ports the
+ * plan names are never re-probed: only a port the operating system assigned is replaced.
  */
 async function startServer() {
-  const port = await probeFreePort();
-  return spawnListeningServer(buildEnv({ PORT: String(port) }), port);
+  let lastError = null;
+
+  for (let attempt = 0; attempt < PROBED_PORT_ATTEMPTS; attempt += 1) {
+    const port = await probeFreePort();
+
+    try {
+      return await spawnListeningServer(buildEnv({ PORT: String(port) }), port);
+    } catch (error) {
+      if (error.portInUse !== true) {
+        throw error;
+      }
+
+      lastError = error;
+    }
+  }
+
+  throw lastError;
 }
 
 /*
- * Sends SIGINT to a server child and resolves with the status it exited with. The exit listener is
- * attached before the signal is sent, because a fast exit nobody is listening for would leave the
- * case waiting forever; a child that has already exited resolves immediately for the same reason.
+ * Sends SIGINT to a server child and resolves with the status it exited with. Input: the server
+ * object spawnListeningServer returned, whose child is the process to stop. Output: { code, signal }.
+ * The close listener is attached before the signal is sent, because a fast exit nobody is listening
+ * for would leave the case waiting forever; a child that has already exited resolves immediately for
+ * the same reason.
+ *
+ * It settles on 'close' rather than 'exit' so the pipes are fully drained before a case reads the
+ * child's stderr: stdout and stderr are separate streams, so a diagnostic written beside the startup
+ * line can still be in flight when 'exit' fires, and a teardown resolving there would hand the case
+ * an incomplete stderrText. Same reasoning as spawnExpectingExit, which settles on 'close' for
+ * exactly this reason.
+ *
+ * The wait is bounded, because the plan makes a server still listening after SIGINT a failure of the
+ * shutdown gate: unbounded, that failure would arrive as a run that never ends rather than as the
+ * failing case it is. The child is killed at the bound and reported with its own output, whether it
+ * was still running or had exited without its pipes closing.
  */
-function stopServer(child) {
-  return new Promise((resolve) => {
+function stopServer(server) {
+  const { child } = server;
+
+  return new Promise((resolve, reject) => {
     if (child.exitCode !== null || child.signalCode !== null) {
       resolve({ code: child.exitCode, signal: child.signalCode });
       return;
     }
 
-    child.once('exit', (code, signal) => resolve({ code, signal }));
+    const timer = setTimeout(() => {
+      // 'close' has not fired by the bound, which is either a child that is still running or one
+      // that exited without its output pipes closing: the message names which, so the failure stays
+      // actionable instead of reporting a stopped process as a running server.
+      const reason =
+        child.exitCode === null && child.signalCode === null
+          ? `was still running ${SIGINT_EXIT_TIMEOUT_MS} ms after SIGINT`
+          : `exited without closing its output pipes within ${SIGINT_EXIT_TIMEOUT_MS} ms of SIGINT`;
+
+      // The child is killed before the case fails: a server that ignores SIGINT must not be left
+      // running on the host.
+      child.kill('SIGKILL');
+      reject(
+        new Error(
+          `The server ${reason}.\n${describeOutput(server.stdoutLines, server.stderrText)}`,
+        ),
+      );
+    }, SIGINT_EXIT_TIMEOUT_MS);
+
+    child.once('close', (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    });
     child.kill('SIGINT');
   });
 }
@@ -304,13 +381,62 @@ async function stopAndAssertCleanExit(server) {
 }
 
 /*
+ * Ends one sub-case and reports whatever went wrong in it. Inputs: the server the case started (null
+ * when it failed before a server existed) and the error the case's own body raised (null when the
+ * body passed). Output: none when the body passed and the child was stopped cleanly; otherwise it
+ * throws.
+ *
+ * The body's own error stays the reported cause even when the teardown assertion then fails too,
+ * because the failure the case was written to catch — a wrong status, a wrong body, a missing
+ * startup line — is the one whose diagnosis a reader needs. A teardown error thrown over it would
+ * discard that failure and point the run at the wrong place, so the case's error object is kept as
+ * it is, with the teardown failure appended to its message and attached as `teardownError`, and its
+ * stack still ending at the assertion that failed first.
+ */
+async function finishSubCase(server, caseError) {
+  let teardownError = null;
+
+  if (server !== null) {
+    try {
+      await stopAndAssertCleanExit(server);
+    } catch (error) {
+      teardownError = error;
+    }
+  }
+
+  if (caseError === null) {
+    if (teardownError !== null) {
+      throw teardownError;
+    }
+
+    return;
+  }
+
+  if (teardownError !== null) {
+    caseError.message = `${caseError.message}\nAdditionally, the teardown failed: ${teardownError.message}`;
+    caseError.teardownError = teardownError;
+  }
+
+  throw caseError;
+}
+
+/*
  * Issues one HTTP request against the server and resolves with its status, headers and body.
  * Inputs: the port, the method and the request target. Each request opens its own connection and
  * drains its response, so no keep-alive socket outlives a case and the client never interferes with
  * the server's shutdown.
+ *
+ * Waiting for the response is bounded, because a server that accepts the connection but never
+ * answers would otherwise leave this promise unsettled and hang the whole run rather than fail its
+ * case: on expiry the request is destroyed and the case fails naming the request that went
+ * unanswered.
  */
 function request(port, method, path) {
   return new Promise((resolve, reject) => {
+    // Assigned once the request exists: both settling arms clear it, and the expiry arm needs the
+    // request itself in order to destroy it.
+    let timer = null;
+
     const clientRequest = http.request(
       { host: '127.0.0.1', port, method, path, agent: false },
       (res) => {
@@ -321,12 +447,25 @@ function request(port, method, path) {
           body += chunk;
         });
         res.on('end', () => {
+          clearTimeout(timer);
           resolve({ statusCode: res.statusCode, headers: res.headers, body });
         });
       },
     );
 
-    clientRequest.on('error', reject);
+    timer = setTimeout(() => {
+      clientRequest.destroy();
+      reject(
+        new Error(
+          `No response to ${method} ${path} on port ${port} within ${REQUEST_TIMEOUT_MS} ms.`,
+        ),
+      );
+    }, REQUEST_TIMEOUT_MS);
+
+    clientRequest.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
     clientRequest.end();
   });
 }
@@ -449,6 +588,7 @@ function waitForLineCount(server, expectedLineCount) {
 test('server.js HTTP contract and process gates', async (t) => {
   await t.test('GET /hello answers 200 with the hello contract', async () => {
     let server = null;
+    let caseError = null;
 
     try {
       server = await startServer();
@@ -459,15 +599,17 @@ test('server.js HTTP contract and process gates', async (t) => {
       assert.strictEqual(response.headers['content-type'], CONTENT_TYPE_PLAIN);
       assert.strictEqual(response.headers['content-length'], String(HELLO_BODY_LENGTH));
       assert.strictEqual(response.body, HELLO_BODY);
+    } catch (error) {
+      // Held for the teardown below: the case's own failure must stay the reported cause.
+      caseError = error;
     } finally {
-      if (server !== null) {
-        await stopAndAssertCleanExit(server);
-      }
+      await finishSubCase(server, caseError);
     }
   });
 
   await t.test('a query string does not defeat the hello match', async () => {
     let server = null;
+    let caseError = null;
 
     try {
       server = await startServer();
@@ -478,15 +620,17 @@ test('server.js HTTP contract and process gates', async (t) => {
       assert.strictEqual(response.headers['content-type'], CONTENT_TYPE_PLAIN);
       assert.strictEqual(response.headers['content-length'], String(HELLO_BODY_LENGTH));
       assert.strictEqual(response.body, HELLO_BODY);
+    } catch (error) {
+      // Held for the teardown below: the case's own failure must stay the reported cause.
+      caseError = error;
     } finally {
-      if (server !== null) {
-        await stopAndAssertCleanExit(server);
-      }
+      await finishSubCase(server, caseError);
     }
   });
 
   await t.test('an undefined path answers the not-found contract', async () => {
     let server = null;
+    let caseError = null;
 
     try {
       server = await startServer();
@@ -494,15 +638,17 @@ test('server.js HTTP contract and process gates', async (t) => {
       for (const path of UNDEFINED_PATHS) {
         assertNotFoundResponse(await request(server.port, 'GET', path));
       }
+    } catch (error) {
+      // Held for the teardown below: the case's own failure must stay the reported cause.
+      caseError = error;
     } finally {
-      if (server !== null) {
-        await stopAndAssertCleanExit(server);
-      }
+      await finishSubCase(server, caseError);
     }
   });
 
   await t.test('a defined path reached with another method answers the not-found contract', async () => {
     let server = null;
+    let caseError = null;
 
     try {
       server = await startServer();
@@ -515,15 +661,17 @@ test('server.js HTTP contract and process gates', async (t) => {
         // and no Allow header to answer with.
         assert.strictEqual(response.headers.allow, undefined);
       }
+    } catch (error) {
+      // Held for the teardown below: the case's own failure must stay the reported cause.
+      caseError = error;
     } finally {
-      if (server !== null) {
-        await stopAndAssertCleanExit(server);
-      }
+      await finishSubCase(server, caseError);
     }
   });
 
   await t.test('HEAD /hello answers the 404 headers with no body at all', async () => {
     let server = null;
+    let caseError = null;
 
     try {
       server = await startServer();
@@ -536,24 +684,27 @@ test('server.js HTTP contract and process gates', async (t) => {
       // A HEAD response carries the headers of the matching GET and no body, so the server ending
       // the response with the not-found body is correct while zero bytes reach the client.
       assert.strictEqual(response.body, '');
+    } catch (error) {
+      // Held for the teardown below: the case's own failure must stay the reported cause.
+      caseError = error;
     } finally {
-      if (server !== null) {
-        await stopAndAssertCleanExit(server);
-      }
+      await finishSubCase(server, caseError);
     }
   });
 
   await t.test('a trailing slash is not the defined path', async () => {
     let server = null;
+    let caseError = null;
 
     try {
       server = await startServer();
 
       assertNotFoundResponse(await request(server.port, 'GET', HELLO_PATH + '/'));
+    } catch (error) {
+      // Held for the teardown below: the case's own failure must stay the reported cause.
+      caseError = error;
     } finally {
-      if (server !== null) {
-        await stopAndAssertCleanExit(server);
-      }
+      await finishSubCase(server, caseError);
     }
   });
 
@@ -576,6 +727,7 @@ test('server.js HTTP contract and process gates', async (t) => {
     const expectedLineCount = issuedRequests.length + 1;
 
     let server = null;
+    let caseError = null;
 
     try {
       server = await startServer();
@@ -602,15 +754,17 @@ test('server.js HTTP contract and process gates', async (t) => {
           `log line ${index} was ${JSON.stringify(logLine)}`,
         );
       });
+    } catch (error) {
+      // Held for the teardown below: the case's own failure must stay the reported cause.
+      caseError = error;
     } finally {
-      if (server !== null) {
-        await stopAndAssertCleanExit(server);
-      }
+      await finishSubCase(server, caseError);
     }
   });
 
   await t.test('a configured PORT is honoured and reported on stdout', async () => {
     let server = null;
+    let caseError = null;
 
     try {
       server = await startServer();
@@ -630,16 +784,18 @@ test('server.js HTTP contract and process gates', async (t) => {
 
       assert.strictEqual(response.statusCode, 200);
       assert.strictEqual(response.body, HELLO_BODY);
+    } catch (error) {
+      // Held for the teardown below: the case's own failure must stay the reported cause.
+      caseError = error;
     } finally {
-      if (server !== null) {
-        await stopAndAssertCleanExit(server);
-      }
+      await finishSubCase(server, caseError);
     }
   });
 
   await t.test('the inclusive port boundaries 1024 and 65535 are accepted', async () => {
     for (const boundaryPort of ACCEPTED_PORT_BOUNDARIES) {
       let server = null;
+      let caseError = null;
 
       try {
         server = await spawnListeningServer(
@@ -653,10 +809,11 @@ test('server.js HTTP contract and process gates', async (t) => {
           `expected the startup line for PORT=${boundaryPort}`,
         );
         assert.strictEqual(server.stderrText, '');
+      } catch (error) {
+        // Held for the teardown below: the case's own failure must stay the reported cause.
+        caseError = error;
       } finally {
-        if (server !== null) {
-          await stopAndAssertCleanExit(server);
-        }
+        await finishSubCase(server, caseError);
       }
     }
   });
@@ -664,6 +821,7 @@ test('server.js HTTP contract and process gates', async (t) => {
   await t.test('an unset, empty or whitespace-only PORT falls back to the default 3000', async () => {
     for (const rawPortValue of FALLBACK_PORT_VALUES) {
       let server = null;
+      let caseError = null;
 
       try {
         server = await spawnListeningServer(buildEnv({ PORT: rawPortValue }), DEFAULT_PORT);
@@ -673,11 +831,33 @@ test('server.js HTTP contract and process gates', async (t) => {
           [startupLine(DEFAULT_PORT)],
           `expected the default port for PORT=${JSON.stringify(rawPortValue)}`,
         );
+        // The default-port gate fixes the startup line and nothing on stderr, so the second half of
+        // the row is asserted here as it is in the configured-PORT and boundary cases: a regression
+        // that printed a diagnostic while still printing the startup line would otherwise pass.
+        assert.strictEqual(
+          server.stderrText,
+          '',
+          `expected no stderr for PORT=${JSON.stringify(rawPortValue)}`,
+        );
+      } catch (error) {
+        // Held for the teardown below: the case's own failure must stay the reported cause.
+        caseError = error;
       } finally {
-        if (server !== null) {
-          await stopAndAssertCleanExit(server);
-        }
+        await finishSubCase(server, caseError);
       }
+
+      // The row is checked twice on purpose. The arm inside the loop is the counterpart the sibling
+      // cases carry, evaluated as soon as the startup line arrives on stdout; this one runs after
+      // finishSubCase returned, so the child has exited and both pipes are closed and its stderr is
+      // complete. Stdout and stderr are delivered as separate events, so a diagnostic written in
+      // the same tick as the startup line can still be in flight when the arm above is evaluated:
+      // this one is what makes such a regression fail the case. Reaching here means the body passed
+      // and the child was stopped cleanly, so the server object always exists.
+      assert.strictEqual(
+        server.stderrText,
+        '',
+        `expected no stderr for PORT=${JSON.stringify(rawPortValue)}`,
+      );
     }
   });
 
@@ -725,12 +905,13 @@ test('server.js HTTP contract and process gates', async (t) => {
   await t.test('SIGINT shuts the server down cleanly with status 0', async () => {
     let server = null;
     let exitStatus = null;
+    let caseError = null;
 
     try {
       server = await startServer();
       await request(server.port, 'GET', HELLO_PATH);
 
-      // stop() attaches its exit listener before it sends the signal, so a fast exit is not missed.
+      // stop() attaches its close listener before it sends the signal, so a fast exit is not missed.
       exitStatus = await server.stop();
 
       // The shutdown line is written by the child just before it exits and the pipe to this process
@@ -748,11 +929,17 @@ test('server.js HTTP contract and process gates', async (t) => {
 
       assert.strictEqual(shutdownLines.length, 1);
       assert.match(shutdownLines[0], SHUTDOWN_LINE_PATTERN);
+    } catch (error) {
+      // Held for the teardown below: the case's own failure must stay the reported cause.
+      caseError = error;
     } finally {
       // Already stopped on the happy path, where stop() resolves from the status it recorded; this
-      // tears the child down if the case failed before that point.
+      // tears the child down if the case failed before that point, and reports the case's own
+      // failure either way.
       if (server !== null && exitStatus === null) {
-        await stopAndAssertCleanExit(server);
+        await finishSubCase(server, caseError);
+      } else if (caseError !== null) {
+        throw caseError;
       }
     }
   });
