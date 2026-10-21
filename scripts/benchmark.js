@@ -517,10 +517,10 @@ function reportGate(name, passed, detail) {
 // --- Entry point ------------------------------------------------------------
 
 /*
- * Runs the three gates against the one server `startServerUnderTest` started and returns the
- * process status: 0 when all three pass, 1 when any fails or cannot be measured. A failed gate sets
- * the status but does not stop the run, so one execution reports all three. Every gate runs inside a
- * try whose finally stops the child, so no failure can leave a server process behind.
+ * Runs the three gates against the one server `startServerUnderTest` started. Input: none. Output:
+ * none; it sets the process exit status: `process.exitCode` is 0 when all three pass and 1 when any
+ * fails or cannot be measured. A failed gate still lets the run report all three, and the single
+ * try/finally around them stops the child, so no failure can leave a server process behind.
  */
 async function main() {
   const { port, server } = await startServerUnderTest();

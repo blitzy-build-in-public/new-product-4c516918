@@ -23,9 +23,13 @@ const DEFAULT_PORT = 3000;
 const MIN_PORT = 1024;
 const MAX_PORT = 65535;
 
-// PORT arrives from the environment as a string, so only digits are accepted: "abc", "3000.5",
-// "-1" and "70000" are rejected with an actionable message rather than silently coerced.
+// PORT arrives from the environment as a string, so only digits are accepted: "abc", "3000.5"
+// and "-1" are rejected with an actionable message rather than silently coerced. The upper bound
+// is not this pattern's job — "70000" passes it and the range check below rejects it.
 const DIGITS_ONLY_PATTERN = /^\d+$/;
+
+// C0 controls and DEL become the text `\xNN`, so no value can split or control the log line.
+const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001F\u007F]/g;
 
 const CONTENT_TYPE_TEXT = 'text/plain';
 const HELLO_BODY = 'Hello world';
@@ -136,10 +140,22 @@ function resolvePathname(rawUrl, hostHeader) {
 /*
  * Writes the one line this server emits per request, before any routing decision is taken.
  * Input: the request. The target is logged exactly as received, so the line shows what the client
- * asked for even though the router matches on the parsed pathname instead.
+ * asked for even though the router matches on the parsed pathname instead. C0 control characters
+ * and DEL are rendered as the text escape `\xNN` before the line is written, because a raw CR or
+ * LF would forge a second log line and a raw ESC would begin a terminal escape sequence. The
+ * runtime's parser keeps that unreachable today — the request target it admits holds only
+ * printable ASCII, verified on Node 22 — so nothing a reachable request observes changes; the
+ * escape is what keeps the line's integrity from resting on that invariant alone.
  */
 function logRequest(req) {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  const line = `[${new Date().toISOString()}] ${req.method} ${req.url}`;
+  // The two-character `\x` prefix and two lowercase hex digits keep every character, in one line.
+  const neutralizedLine = line.replace(
+    CONTROL_CHARACTER_PATTERN,
+    (character) => `\\x${character.charCodeAt(0).toString(16).padStart(2, '0')}`,
+  );
+
+  console.log(neutralizedLine);
 }
 
 /*
@@ -156,13 +172,17 @@ function sendText(res, statusCode, body) {
   res.end(body);
 }
 
-// Answers the one defined route: GET /hello, 200 with the hello body.
+// Answers the one defined route: GET /hello, 200 with the hello body. Inputs: the request and the
+// response; the request is unused because the route is fixed. Output: none — sendText writes the
+// response.
 function handleHello(req, res) {
   sendText(res, 200, HELLO_BODY);
 }
 
-// The fallback for every request no route matched. It carries no detail about why the request was
-// unmatched, so no path list, stack trace or internal error text can reach the client.
+// The fallback for every request no route matched. Inputs: the request and the response; the
+// request is unused because the response is fixed. Output: none — sendText writes the 404 with
+// the not-found body, which carries no detail about why the request was unmatched, so no path
+// list, stack trace or internal error text can reach the client.
 function handleNotFound(req, res) {
   sendText(res, 404, NOT_FOUND_BODY);
 }
@@ -205,8 +225,9 @@ function routeRequest(req, res) {
 let configuredPort = DEFAULT_PORT;
 
 /*
- * Reports a server-level error and ends the process with status 1. Input: the error the server
- * emitted. Every message names the port and the remedy, and every one goes to stderr, so no
+ * Reports a server-level error and ends the process with status 1, so it never returns. Input: the
+ * error the server emitted. The EADDRINUSE and EACCES branches name the port and its remedy; any
+ * other error is reported with the runtime's own text. Every message goes to stderr, so no
  * diagnostic reaches a response body.
  */
 function handleServerError(error) {
@@ -224,8 +245,7 @@ function handleServerError(error) {
  * print. The write is completed before the exit is requested, because process.exit() does not
  * wait for a pending stderr write: with stderr on a pipe under backpressure the message would
  * otherwise be dropped and the process would end silently, losing the only diagnostic there is.
- * The message is written as its own line, exactly as console.error writes it, so the output each
- * caller produced is unchanged.
+ * The message goes out as its own newline-terminated line, exactly as console.error writes it.
  */
 function reportFatalMessageAndExit(message) {
   process.stderr.write(`${message}\n`, () => {
@@ -236,15 +256,38 @@ function reportFatalMessageAndExit(message) {
 /*
  * Registers the SIGINT handler for shutdown. Input: the server to close. The sequence writes the
  * shutdown line, stops accepting connections, releases idle keep-alive sockets, and exits with
- * status 0 from inside the close callback, so the process never ends while a response is still
- * being written.
+ * status 0 once the line has been written and the server has closed, so the process never ends
+ * while a response is still being written and never ends with the shutdown line still queued.
  */
 function registerShutdownHandlers(server) {
   process.on('SIGINT', () => {
-    console.log(shutdownMessage());
+    // The two steps below complete independently — the write of the shutdown line is asynchronous
+    // when stdout is a pipe — so each records its completion and whichever finishes last requests
+    // the exit. Neither the line nor the close is cut short by the other's timing.
+    let shutdownLineWritten = false;
+    let serverClosed = false;
 
+    const exitAfterShutdown = () => {
+      if (shutdownLineWritten && serverClosed) {
+        process.exit(0);
+      }
+    };
+
+    // The line goes out through its write completion callback — the console's own logging cannot
+    // supply one — and as its own line exactly as console.log writes it, so its bytes and its
+    // stream are unchanged. process.exit() does not wait for a pending stdout write, so without
+    // the callback this line — the only record a clean shutdown leaves — would be dropped whenever
+    // stdout is a pipe whose reader has stalled, while the status still read 0.
+    process.stdout.write(`${shutdownMessage()}\n`, () => {
+      shutdownLineWritten = true;
+      exitAfterShutdown();
+    });
+
+    // Called straight away rather than after the write completes, so the listener stops accepting
+    // new connections the moment SIGINT arrives; only the exit waits for the line.
     server.close(() => {
-      process.exit(0);
+      serverClosed = true;
+      exitAfterShutdown();
     });
 
     // close() releases idle keep-alive sockets by itself only from v19.0.0 onwards. The call is
@@ -264,7 +307,7 @@ function startServer(port) {
   const server = http.createServer(routeRequest);
 
   // Registered before listen(): an 'error' event with no listener is thrown by the emitter and
-  // would replace the actionable message below with a stack trace.
+  // would replace handleServerError's actionable message with a stack trace.
   server.on('error', handleServerError);
   registerShutdownHandlers(server);
 
