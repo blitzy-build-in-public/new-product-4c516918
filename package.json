@@ -1,0 +1,15 @@
+{
+  "name": "nodejs-tutorial-hello-world",
+  "version": "1.0.0",
+  "description": "Minimal Node.js HTTP server tutorial demonstrating single endpoint implementation",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/server.test.js",
+    "bench": "node scripts/benchmark.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["nodejs", "tutorial", "http", "server", "beginner"]
+}
