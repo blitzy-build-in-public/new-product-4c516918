@@ -101,7 +101,7 @@ unmatched requests are both logged. The format is an ISO-8601 timestamp in squar
 method, and then the request target as received.
 
 ```text
-2026-01-15T10:30:00.000Z GET /hello
+[2026-01-15T10:30:00.000Z] GET /hello
 ```
 
 The startup line, the request lines and the shutdown line are written to stdout. Configuration and
@@ -146,7 +146,7 @@ negative such as `-1` included, reports the range message above instead.
 Press `CTRL+C` in the terminal running the server. It logs one line and stops:
 
 ```text
-2026-01-15T10:30:00.000Z Server shutting down
+[2026-01-15T10:30:00.000Z] Server shutting down
 ```
 
 The process exits with status 0, so the next shell prompt is reached cleanly.
