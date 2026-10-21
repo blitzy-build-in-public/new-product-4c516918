@@ -1,15 +1,14 @@
 'use strict';
 
 /*
- * Verification suite for the tutorial HTTP server (AAP 0.5.1 Component D).
+ * Verification suite for the tutorial HTTP server.
  *
  * It exercises the real `server.js` the way a user runs it — spawned as a child process, never
- * imported — and asserts the functional, logging, configuration and shutdown gates the plan fixes
- * (AAP 0.8). Only what the runtime ships is used: `node:test` as the runner, `node:assert/strict`
- * for the assertions, `node:http` as the client (never the global fetch, which is experimental
- * across the runtime's 18.x line), `node:net` to find and hold ports, and `node:child_process` to
- * start the server. The three performance gates live in `scripts/benchmark.js` and are not
- * repeated here.
+ * imported — and asserts the functional, logging, configuration and shutdown gates. Only what the
+ * runtime ships is used: `node:test` as the runner, `node:assert/strict` for the assertions,
+ * `node:http` as the client (never the global fetch, which is experimental across the runtime's
+ * 18.x line), `node:net` to find and hold ports, and `node:child_process` to start the server. The
+ * three performance gates live in `scripts/benchmark.js` and are not repeated here.
  *
  * Every case owns its port and its child process, and stops the child in a `finally` block, so a
  * failing assertion can never leave a server running.
@@ -21,7 +20,7 @@ const http = require('node:http');
 const net = require('node:net');
 const test = require('node:test');
 
-// --- Values fixed by the plan (AAP 0.3.3, 0.5.2, 0.8) ------------------------
+// --- Values fixed by the server's contracts and messages --------------------
 
 // The response contracts, down to the byte: the content type carries no charset parameter and each
 // body has a fixed byte length.
@@ -39,10 +38,10 @@ const NOT_FOUND_BODY_LENGTH = 9;
 const UNDEFINED_PATHS = ['/invalid', '/', '/anything/else'];
 
 // Methods the route table holds no key for. A defined path reached with one of them takes the same
-// 404 as an undefined path: the plan fixes 404 for that case and adds no 405 and no Allow header.
+// 404 as an undefined path: the contract answers it with 404 and adds no 405 and no Allow header.
 const UNMATCHED_HELLO_METHODS = ['POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'];
 
-// Port configuration (AAP 0.5.2). The accepted range is inclusive at both ends; 1024 and 65535 are
+// Port configuration. The accepted range is inclusive at both ends; 1024 and 65535 are
 // valid, 1023 and 65536 are not.
 const DEFAULT_PORT = 3000;
 const MIN_PORT = 1024;
@@ -60,9 +59,9 @@ const RANGE_REJECTED_PORT_VALUES = ['abc', '3000.5', '-1', '70000'];
 // and the server rejects it — take the privileged-port message.
 const PRIVILEGED_PORT_VALUES = ['0', '80', '1023'];
 
-// Message and line literals quoted from AAP 0.5.2, reproduced verbatim so the suite asserts exactly
-// the text a user reads. Each one states an offending value, the accepted range and the correction,
-// which is what makes it actionable.
+// Message and line literals reproduced verbatim from `server.js`, so the suite asserts exactly the
+// text a user reads. Each of the three messages states an offending value, the accepted range and
+// the correction, which is what makes it actionable.
 
 // Triggered by a PORT that is not a whole number of digits in range: non-numeric, fractional,
 // negative, or above 65535.
@@ -85,7 +84,10 @@ const startupLine = (port) => `${STARTUP_LINE_PREFIX}${port}`;
 // The tail of the line the server prints when it receives SIGINT.
 const SHUTDOWN_LINE_SUFFIX = ' Server shutting down';
 
-// One request log line: an ISO-8601 timestamp, the method, then the request target as received.
+// One request log line: an ISO-8601 timestamp, the method, then the request target as received. Its
+// method alternation lists the methods the logging case issues, and that case is the only one that
+// matches a line against this pattern: a case issuing another method — OPTIONS, for instance —
+// would have to widen the alternation here too, or fail on a line the server logged correctly.
 const LOG_LINE_PATTERN =
   /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] (GET|POST|HEAD|PUT|DELETE) \S+$/;
 
@@ -98,9 +100,9 @@ const SHUTDOWN_LINE_PATTERN =
 const STARTUP_TIMEOUT_MS = 10000;
 const LINE_POLL_INTERVAL_MS = 10;
 
-// The two waits that follow a live server are bounded for the same reason, because the plan makes a
-// server that is still listening after SIGINT, or that never answers, a failure of the shutdown and
-// request gates: without a bound that failure would arrive as a run that never ends instead.
+// The two waits that follow a live server are bounded for the same reason: a server that is still
+// listening after SIGINT, or that never answers, is a failure of the shutdown and request gates,
+// and without a bound that failure would arrive as a run that never ends instead.
 const SIGINT_EXIT_TIMEOUT_MS = 5000;
 const REQUEST_TIMEOUT_MS = 5000;
 
@@ -284,7 +286,7 @@ async function spawnListeningServer(env, expectedPort) {
  * whose failure was that collision is retried with a fresh port, up to PROBED_PORT_ATTEMPTS times.
  * Anything else is reported at once, and the last attempt's error is thrown when every attempt
  * collided, so the case still fails with the child's own EADDRINUSE diagnostic. The fixed ports the
- * plan names are never re-probed: only a port the operating system assigned is replaced.
+ * constants above name are never re-probed: only an operating-system-assigned port is replaced.
  */
 async function startServer() {
   let lastError = null;
@@ -316,11 +318,10 @@ async function startServer() {
  * It settles on 'close' rather than 'exit' so the pipes are fully drained before a case reads the
  * child's stderr: stdout and stderr are separate streams, so a diagnostic written beside the startup
  * line can still be in flight when 'exit' fires, and a teardown resolving there would hand the case
- * an incomplete stderrText. Same reasoning as spawnExpectingExit, which settles on 'close' for
- * exactly this reason.
+ * an incomplete stderrText. spawnExpectingExit settles on 'close' for the same reason.
  *
- * The wait is bounded, because the plan makes a server still listening after SIGINT a failure of the
- * shutdown gate: unbounded, that failure would arrive as a run that never ends rather than as the
+ * The wait is bounded, because a server still listening after SIGINT is a failure of the shutdown
+ * gate: unbounded, that failure would arrive as a run that never ends rather than as the
  * failing case it is. The child is killed at the bound and reported with its own output, whether it
  * was still running or had exited without its pipes closing.
  */
@@ -361,7 +362,7 @@ function stopServer(server) {
 }
 
 /*
- * Stops a server and asserts the clean SIGINT teardown the plan specifies: exit status 0 and no
+ * Stops a server and asserts the clean SIGINT teardown the server delivers: exit status 0 and no
  * signal death. Every case that starts a server tears it down through this, so a failing assertion
  * still stops the child and a teardown that misbehaves is reported as a failure of its own.
  */
@@ -582,7 +583,7 @@ function waitForLineCount(server, expectedLineCount) {
 // --- The suite --------------------------------------------------------------
 
 /*
- * One parent case with one sub-case per plan gate, awaited so the sub-cases run in order: each owns
+ * One parent case with one sub-case per gate, awaited so the sub-cases run in order: each owns
  * its own port and its own child process, so one failure cannot disturb the next.
  */
 test('server.js HTTP contract and process gates', async (t) => {
@@ -600,7 +601,6 @@ test('server.js HTTP contract and process gates', async (t) => {
       assert.strictEqual(response.headers['content-length'], String(HELLO_BODY_LENGTH));
       assert.strictEqual(response.body, HELLO_BODY);
     } catch (error) {
-      // Held for the teardown below: the case's own failure must stay the reported cause.
       caseError = error;
     } finally {
       await finishSubCase(server, caseError);
@@ -621,7 +621,6 @@ test('server.js HTTP contract and process gates', async (t) => {
       assert.strictEqual(response.headers['content-length'], String(HELLO_BODY_LENGTH));
       assert.strictEqual(response.body, HELLO_BODY);
     } catch (error) {
-      // Held for the teardown below: the case's own failure must stay the reported cause.
       caseError = error;
     } finally {
       await finishSubCase(server, caseError);
@@ -639,7 +638,6 @@ test('server.js HTTP contract and process gates', async (t) => {
         assertNotFoundResponse(await request(server.port, 'GET', path));
       }
     } catch (error) {
-      // Held for the teardown below: the case's own failure must stay the reported cause.
       caseError = error;
     } finally {
       await finishSubCase(server, caseError);
@@ -657,12 +655,11 @@ test('server.js HTTP contract and process gates', async (t) => {
         const response = await request(server.port, method, HELLO_PATH);
 
         assertNotFoundResponse(response);
-        // The plan fixes 404 for a defined path reached with the wrong method, so there is no 405
+        // The contract fixes 404 for a defined path reached with the wrong method: there is no 405
         // and no Allow header to answer with.
         assert.strictEqual(response.headers.allow, undefined);
       }
     } catch (error) {
-      // Held for the teardown below: the case's own failure must stay the reported cause.
       caseError = error;
     } finally {
       await finishSubCase(server, caseError);
@@ -685,7 +682,6 @@ test('server.js HTTP contract and process gates', async (t) => {
       // the response with the not-found body is correct while zero bytes reach the client.
       assert.strictEqual(response.body, '');
     } catch (error) {
-      // Held for the teardown below: the case's own failure must stay the reported cause.
       caseError = error;
     } finally {
       await finishSubCase(server, caseError);
@@ -701,7 +697,6 @@ test('server.js HTTP contract and process gates', async (t) => {
 
       assertNotFoundResponse(await request(server.port, 'GET', HELLO_PATH + '/'));
     } catch (error) {
-      // Held for the teardown below: the case's own failure must stay the reported cause.
       caseError = error;
     } finally {
       await finishSubCase(server, caseError);
@@ -755,7 +750,6 @@ test('server.js HTTP contract and process gates', async (t) => {
         );
       });
     } catch (error) {
-      // Held for the teardown below: the case's own failure must stay the reported cause.
       caseError = error;
     } finally {
       await finishSubCase(server, caseError);
@@ -785,7 +779,6 @@ test('server.js HTTP contract and process gates', async (t) => {
       assert.strictEqual(response.statusCode, 200);
       assert.strictEqual(response.body, HELLO_BODY);
     } catch (error) {
-      // Held for the teardown below: the case's own failure must stay the reported cause.
       caseError = error;
     } finally {
       await finishSubCase(server, caseError);
@@ -810,7 +803,6 @@ test('server.js HTTP contract and process gates', async (t) => {
         );
         assert.strictEqual(server.stderrText, '');
       } catch (error) {
-        // Held for the teardown below: the case's own failure must stay the reported cause.
         caseError = error;
       } finally {
         await finishSubCase(server, caseError);
@@ -840,7 +832,6 @@ test('server.js HTTP contract and process gates', async (t) => {
           `expected no stderr for PORT=${JSON.stringify(rawPortValue)}`,
         );
       } catch (error) {
-        // Held for the teardown below: the case's own failure must stay the reported cause.
         caseError = error;
       } finally {
         await finishSubCase(server, caseError);
@@ -930,7 +921,6 @@ test('server.js HTTP contract and process gates', async (t) => {
       assert.strictEqual(shutdownLines.length, 1);
       assert.match(shutdownLines[0], SHUTDOWN_LINE_PATTERN);
     } catch (error) {
-      // Held for the teardown below: the case's own failure must stay the reported cause.
       caseError = error;
     } finally {
       // Already stopped on the happy path, where stop() resolves from the status it recorded; this
