@@ -211,14 +211,26 @@ let configuredPort = DEFAULT_PORT;
  */
 function handleServerError(error) {
   if (error.code === 'EADDRINUSE') {
-    console.error(portInUseMessage(configuredPort));
+    reportFatalMessageAndExit(portInUseMessage(configuredPort));
   } else if (error.code === 'EACCES') {
-    console.error(permissionDeniedMessage(configuredPort));
+    reportFatalMessageAndExit(permissionDeniedMessage(configuredPort));
   } else {
-    console.error(bindFailureMessage(error));
+    reportFatalMessageAndExit(bindFailureMessage(error));
   }
+}
 
-  process.exit(1);
+/*
+ * Reports a fatal condition on stderr and ends the process with status 1. Input: the message to
+ * print. The write is completed before the exit is requested, because process.exit() does not
+ * wait for a pending stderr write: with stderr on a pipe under backpressure the message would
+ * otherwise be dropped and the process would end silently, losing the only diagnostic there is.
+ * The message is written as its own line, exactly as console.error writes it, so the output each
+ * caller produced is unchanged.
+ */
+function reportFatalMessageAndExit(message) {
+  process.stderr.write(`${message}\n`, () => {
+    process.exit(1);
+  });
 }
 
 /*
@@ -263,13 +275,12 @@ function startServer(port) {
 
 // --- Process entry ----------------------------------------------------------
 
-// Validate the configured port first, then start the server. A configuration failure prints its
-// message to stderr and ends the process with status 1 before any server exists.
+// Validate the configured port and start the server in one guarded sequence. A configuration
+// failure reports its message on stderr and ends the process with status 1 without ever reaching
+// startServer, so a rejected PORT ends the process before any server exists.
 try {
   configuredPort = parsePort(process.env.PORT);
+  startServer(configuredPort);
 } catch (error) {
-  console.error(error.message);
-  process.exit(1);
+  reportFatalMessageAndExit(error.message);
 }
-
-startServer(configuredPort);
